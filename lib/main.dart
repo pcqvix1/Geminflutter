@@ -141,7 +141,9 @@ class ChatAttachment {
   );
 }
 
-class ChatMessage {
+const _streamUiFrame = Duration(milliseconds: 80);
+
+class ChatMessage extends ChangeNotifier {
   ChatMessage({
     required this.id,
     required this.sessionId,
@@ -161,6 +163,8 @@ class ChatMessage {
   final DateTime createdAt;
   final List<ChatAttachment> attachments;
   bool isStreaming;
+  Timer? _streamNotifyTimer;
+  bool _hasPendingStreamNotify = false;
 
   Map<String, dynamic> toMap() => {
     'id': id,
@@ -183,6 +187,42 @@ class ChatMessage {
         .map((a) => ChatAttachment.fromMap(Map<String, dynamic>.from(a)))
         .toList(),
   );
+
+  void appendStreamChunk(GeminiStreamChunk chunk) {
+    if (chunk.isThought) {
+      thoughtText += chunk.text;
+    } else {
+      text += chunk.text;
+    }
+    _notifyStreamFrame();
+  }
+
+  void finishStreaming() {
+    _streamNotifyTimer?.cancel();
+    _streamNotifyTimer = null;
+    _hasPendingStreamNotify = false;
+    isStreaming = false;
+    notifyListeners();
+  }
+
+  void _notifyStreamFrame() {
+    if (_streamNotifyTimer?.isActive ?? false) {
+      _hasPendingStreamNotify = true;
+      return;
+    }
+    notifyListeners();
+    _streamNotifyTimer = Timer(_streamUiFrame, () {
+      if (!_hasPendingStreamNotify) return;
+      _hasPendingStreamNotify = false;
+      notifyListeners();
+    });
+  }
+
+  @override
+  void dispose() {
+    _streamNotifyTimer?.cancel();
+    super.dispose();
+  }
 }
 
 class GeminiStreamChunk {
@@ -382,6 +422,7 @@ class ChatController extends ChangeNotifier {
 
   List<ChatSession> sessions = [];
   List<ChatMessage> messages = [];
+  final Map<String, String> _sessionSearchIndex = {};
   String? activeSessionId;
   String query = '';
   bool isSending = false;
@@ -398,16 +439,14 @@ class ChatController extends ChangeNotifier {
     final q = query.trim().toLowerCase();
     if (q.isEmpty) return sessions;
     return sessions.where((s) {
-      final haystack = [
-        s.title,
-        ...store.loadMessages(s.id).map((m) => m.text),
-      ].join('\n').toLowerCase();
-      return haystack.contains(q);
+      final indexed = _sessionSearchIndex[s.id] ?? s.title.toLowerCase();
+      return indexed.contains(q);
     }).toList();
   }
 
   Future<void> load() async {
     sessions = store.loadSessions();
+    _rebuildSearchIndex();
     if (sessions.isEmpty) {
       await newSession();
       return;
@@ -433,6 +472,7 @@ class ChatController extends ChangeNotifier {
     );
     await store.saveSession(session);
     sessions = store.loadSessions();
+    _sessionSearchIndex[session.id] = session.title.toLowerCase();
     activeSessionId = session.id;
     messages = [];
     notifyListeners();
@@ -441,12 +481,14 @@ class ChatController extends ChangeNotifier {
   Future<void> selectSession(String id) async {
     activeSessionId = id;
     messages = store.loadMessages(id);
+    _indexActiveSession();
     notifyListeners();
   }
 
   Future<void> removeSession(String id) async {
     await store.deleteSession(id);
     sessions = store.loadSessions();
+    _sessionSearchIndex.remove(id);
     if (activeSessionId == id) {
       if (sessions.isEmpty) {
         await newSession();
@@ -493,6 +535,7 @@ class ChatController extends ChangeNotifier {
     session.updatedAt = DateTime.now();
     await store.saveSession(session);
     sessions = store.loadSessions();
+    _indexSession(session, messages);
 
     final cacheKey = _cacheKey(messages);
     final cached = store.cache.get(cacheKey) as String?;
@@ -506,6 +549,7 @@ class ChatController extends ChangeNotifier {
       );
       messages.add(cachedMessage);
       await store.saveMessage(cachedMessage);
+      _indexSession(session, messages);
       notifyListeners();
       return;
     }
@@ -528,30 +572,27 @@ class ChatController extends ChangeNotifier {
         model: model,
         context: messages.take(messages.length - 1).toList(),
       )) {
-        if (chunk.isThought) {
-          answer.thoughtText += chunk.text;
-        } else {
-          answer.text += chunk.text;
-        }
-        notifyListeners();
+        answer.appendStreamChunk(chunk);
       }
-      answer.isStreaming = false;
+      answer.finishStreaming();
       await store.saveMessage(answer);
       await store.cache.put(cacheKey, answer.text);
+      _indexSession(session, messages);
     } on TimeoutException {
       messages.remove(answer);
+      answer.dispose();
       _appendError(
         session.id,
         'A requisicao demorou demais. Verifique sua rede e tente novamente.',
       );
     } catch (e) {
       messages.remove(answer);
+      answer.dispose();
       _appendError(
         session.id,
         e is GeminiException ? e.message : 'Falha de rede: $e',
       );
     } finally {
-      answer.isStreaming = false;
       isSending = false;
       notifyListeners();
     }
@@ -636,6 +677,42 @@ class ChatController extends ChangeNotifier {
         '${last.text}|${last.attachments.map((a) => '${a.name}:${a.size}').join('|')}';
     return base64Url.encode(utf8.encode(raw));
   }
+
+  void _rebuildSearchIndex() {
+    _sessionSearchIndex
+      ..clear()
+      ..addEntries(
+        sessions.map((session) {
+          final sessionMessages = store.loadMessages(session.id);
+          return MapEntry(session.id, _searchTextFor(session, sessionMessages));
+        }),
+      );
+  }
+
+  void _indexActiveSession() {
+    final session = activeSession;
+    if (session == null) return;
+    _indexSession(session, messages);
+  }
+
+  void _indexSession(ChatSession session, List<ChatMessage> sessionMessages) {
+    _sessionSearchIndex[session.id] = _searchTextFor(session, sessionMessages);
+  }
+
+  String _searchTextFor(
+    ChatSession session,
+    List<ChatMessage> sessionMessages,
+  ) {
+    final buffer = StringBuffer(session.title.toLowerCase());
+    for (final message in sessionMessages) {
+      if (message.text.isNotEmpty) {
+        buffer
+          ..write('\n')
+          ..write(message.text.toLowerCase());
+      }
+    }
+    return buffer.toString();
+  }
 }
 
 extension FirstOrNull<T> on Iterable<T> {
@@ -679,43 +756,43 @@ class ChatShell extends StatefulWidget {
 class _ChatShellState extends State<ChatShell> {
   @override
   Widget build(BuildContext context) {
-    return Consumer<ChatController>(
-      builder: (context, controller, _) {
-        return LayoutBuilder(
-          builder: (context, constraints) {
-            final desktop = constraints.maxWidth >= 900;
-            final main = DropRegion(
-              formats: Formats.standardFormats,
-              onDropEnter: (_) => controller.setDragging(true),
-              onDropLeave: (_) => controller.setDragging(false),
-              onDropOver: (_) => DropOperation.copy,
-              onPerformDrop: (event) async {
-                controller.setDragging(false);
-                final attachments = await _attachmentsFromDrop(event);
-                if (!context.mounted || attachments.isEmpty) return;
-                await showDialog<void>(
-                  context: context,
-                  builder: (_) => _DroppedFilesDialog(attachments: attachments),
-                );
-              },
-              child: Stack(
-                children: [
-                  Row(
-                    children: [
-                      if (desktop)
-                        const SizedBox(width: 320, child: SessionSidebar()),
-                      const Expanded(child: ChatPanel()),
-                    ],
-                  ),
-                  if (controller.isDragging) const _DropOverlay(),
-                ],
-              ),
-            );
-            return Scaffold(
-              drawer: desktop ? null : const Drawer(child: SessionSidebar()),
-              body: SafeArea(child: main),
+    final isDragging = context.select<ChatController, bool>(
+      (controller) => controller.isDragging,
+    );
+    final controller = context.read<ChatController>();
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final desktop = constraints.maxWidth >= 900;
+        final main = DropRegion(
+          formats: Formats.standardFormats,
+          onDropEnter: (_) => controller.setDragging(true),
+          onDropLeave: (_) => controller.setDragging(false),
+          onDropOver: (_) => DropOperation.copy,
+          onPerformDrop: (event) async {
+            controller.setDragging(false);
+            final attachments = await _attachmentsFromDrop(event);
+            if (!context.mounted || attachments.isEmpty) return;
+            await showDialog<void>(
+              context: context,
+              builder: (_) => _DroppedFilesDialog(attachments: attachments),
             );
           },
+          child: Stack(
+            children: [
+              Row(
+                children: [
+                  if (desktop)
+                    const SizedBox(width: 320, child: SessionSidebar()),
+                  const Expanded(child: ChatPanel()),
+                ],
+              ),
+              if (isDragging) const _DropOverlay(),
+            ],
+          ),
+        );
+        return Scaffold(
+          drawer: desktop ? null : const Drawer(child: SessionSidebar()),
+          body: SafeArea(child: main),
         );
       },
     );
@@ -878,6 +955,7 @@ class _ChatPanelState extends State<ChatPanel> {
   final _textController = TextEditingController();
   final _scrollController = ScrollController();
   final _attachments = <ChatAttachment>[];
+  int _lastMessageCount = 0;
 
   @override
   void dispose() {
@@ -889,7 +967,11 @@ class _ChatPanelState extends State<ChatPanel> {
   @override
   Widget build(BuildContext context) {
     final controller = context.watch<ChatController>();
-    WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToBottom());
+    final messageCount = controller.messages.length;
+    if (messageCount != _lastMessageCount) {
+      _lastMessageCount = messageCount;
+      WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToBottom());
+    }
     return Scaffold(
       appBar: AppBar(
         title: Text(controller.activeSession?.title ?? 'Gemini Chat'),
@@ -947,8 +1029,11 @@ class _ChatPanelState extends State<ChatPanel> {
                     controller: _scrollController,
                     padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
                     itemCount: controller.messages.length,
-                    itemBuilder: (context, index) =>
-                        MessageBubble(message: controller.messages[index]),
+                    addAutomaticKeepAlives: false,
+                    itemBuilder: (context, index) => MessageBubble(
+                      key: ValueKey(controller.messages[index].id),
+                      message: controller.messages[index],
+                    ),
                   ),
           ),
           if (controller.isSending) const _TypingIndicator(),
@@ -1020,6 +1105,20 @@ class MessageBubble extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: message,
+      builder: (context, _) => _MessageBubbleBody(message: message),
+    );
+  }
+}
+
+class _MessageBubbleBody extends StatelessWidget {
+  const _MessageBubbleBody({required this.message});
+
+  final ChatMessage message;
+
+  @override
+  Widget build(BuildContext context) {
     final colors = Theme.of(context).colorScheme;
     final isUser = message.role == MessageRole.user;
     final isError = message.role == MessageRole.error;
@@ -1033,73 +1132,76 @@ class MessageBubble extends StatelessWidget {
         : isUser
         ? colors.onPrimaryContainer
         : colors.onSurface;
-    return Align(
-      alignment: isUser ? Alignment.centerRight : Alignment.centerLeft,
-      child: ConstrainedBox(
-        constraints: const BoxConstraints(maxWidth: 760),
-        child: Container(
-          margin: const EdgeInsets.symmetric(vertical: 6),
-          padding: const EdgeInsets.all(14),
-          decoration: BoxDecoration(
-            color: bg,
-            borderRadius: BorderRadius.circular(8),
-          ),
-          child: DefaultTextStyle(
-            style: TextStyle(color: fg, height: 1.35),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Icon(
-                      isUser ? Icons.person_outline : Icons.auto_awesome,
-                      size: 16,
-                      color: fg,
-                    ),
-                    const SizedBox(width: 6),
-                    Text(
-                      _roleLabel(message.role),
-                      style: const TextStyle(fontWeight: FontWeight.w700),
-                    ),
-                    if (message.isStreaming) ...[
-                      const SizedBox(width: 8),
-                      const SizedBox(
-                        width: 12,
-                        height: 12,
-                        child: CircularProgressIndicator(strokeWidth: 2),
+    return RepaintBoundary(
+      child: Align(
+        alignment: isUser ? Alignment.centerRight : Alignment.centerLeft,
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 760),
+          child: Container(
+            margin: const EdgeInsets.symmetric(vertical: 6),
+            padding: const EdgeInsets.all(14),
+            decoration: BoxDecoration(
+              color: bg,
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: DefaultTextStyle(
+              style: TextStyle(color: fg, height: 1.35),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(
+                        isUser ? Icons.person_outline : Icons.auto_awesome,
+                        size: 16,
+                        color: fg,
                       ),
+                      const SizedBox(width: 6),
+                      Text(
+                        _roleLabel(message.role),
+                        style: const TextStyle(fontWeight: FontWeight.w700),
+                      ),
+                      if (message.isStreaming) ...[
+                        const SizedBox(width: 8),
+                        const SizedBox(
+                          width: 12,
+                          height: 12,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        ),
+                      ],
                     ],
+                  ),
+                  if (message.thoughtText.trim().isNotEmpty) ...[
+                    const SizedBox(height: 8),
+                    _ThinkingBlock(
+                      text: message.thoughtText,
+                      foreground: fg,
+                      isStreaming: message.isStreaming,
+                      styleSheet: _bubbleMarkdownStyleSheet(context, fg),
+                    ),
                   ],
-                ),
-                if (message.thoughtText.trim().isNotEmpty) ...[
-                  const SizedBox(height: 8),
-                  _ThinkingBlock(
-                    text: message.thoughtText,
-                    foreground: fg,
-                    isStreaming: message.isStreaming,
-                    styleSheet: _bubbleMarkdownStyleSheet(context, fg),
-                  ),
+                  if (message.text.isNotEmpty) ...[
+                    const SizedBox(height: 8),
+                    _MessageText(
+                      text: message.text,
+                      isStreaming: message.isStreaming,
+                      foreground: fg,
+                      styleSheet: _bubbleMarkdownStyleSheet(context, fg),
+                    ),
+                  ],
+                  if (message.attachments.isNotEmpty) ...[
+                    const SizedBox(height: 10),
+                    Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: message.attachments
+                          .map((a) => _AttachmentChip(attachment: a))
+                          .toList(),
+                    ),
+                  ],
                 ],
-                if (message.text.isNotEmpty) ...[
-                  const SizedBox(height: 8),
-                  MarkdownBody(
-                    data: message.text,
-                    selectable: true,
-                    styleSheet: _bubbleMarkdownStyleSheet(context, fg),
-                  ),
-                ],
-                if (message.attachments.isNotEmpty) ...[
-                  const SizedBox(height: 10),
-                  Wrap(
-                    spacing: 8,
-                    runSpacing: 8,
-                    children: message.attachments
-                        .map((a) => _AttachmentChip(attachment: a))
-                        .toList(),
-                  ),
-                ],
-              ],
+              ),
             ),
           ),
         ),
@@ -1150,6 +1252,31 @@ class MessageBubble extends StatelessWidget {
       tableBody: body,
       tableHead: body.copyWith(fontWeight: FontWeight.w700),
     );
+  }
+}
+
+class _MessageText extends StatelessWidget {
+  const _MessageText({
+    required this.text,
+    required this.isStreaming,
+    required this.foreground,
+    required this.styleSheet,
+  });
+
+  final String text;
+  final bool isStreaming;
+  final Color foreground;
+  final MarkdownStyleSheet styleSheet;
+
+  @override
+  Widget build(BuildContext context) {
+    if (isStreaming) {
+      return SelectableText(
+        text,
+        style: TextStyle(color: foreground, height: 1.35),
+      );
+    }
+    return MarkdownBody(data: text, selectable: true, styleSheet: styleSheet);
   }
 }
 
