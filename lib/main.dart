@@ -148,6 +148,7 @@ class ChatMessage {
     required this.role,
     required this.text,
     required this.createdAt,
+    this.thoughtText = '',
     this.attachments = const [],
     this.isStreaming = false,
   });
@@ -156,6 +157,7 @@ class ChatMessage {
   final String sessionId;
   final MessageRole role;
   String text;
+  String thoughtText;
   final DateTime createdAt;
   final List<ChatAttachment> attachments;
   bool isStreaming;
@@ -165,6 +167,7 @@ class ChatMessage {
     'sessionId': sessionId,
     'role': role.name,
     'text': text,
+    'thoughtText': thoughtText,
     'createdAt': createdAt.toIso8601String(),
     'attachments': attachments.map((a) => a.toMap()).toList(),
   };
@@ -174,11 +177,19 @@ class ChatMessage {
     sessionId: data['sessionId'] as String,
     role: MessageRole.values.byName(data['role'] as String),
     text: data['text'] as String,
+    thoughtText: (data['thoughtText'] as String?) ?? '',
     createdAt: DateTime.parse(data['createdAt'] as String),
     attachments: ((data['attachments'] as List?) ?? const [])
         .map((a) => ChatAttachment.fromMap(Map<String, dynamic>.from(a)))
         .toList(),
   );
+}
+
+class GeminiStreamChunk {
+  const GeminiStreamChunk({required this.text, required this.isThought});
+
+  final String text;
+  final bool isThought;
 }
 
 class LocalStore {
@@ -231,7 +242,7 @@ class LocalStore {
 class GeminiService {
   final _client = http.Client();
 
-  Stream<String> streamAnswer({
+  Stream<GeminiStreamChunk> streamAnswer({
     required String apiKey,
     required String model,
     required List<ChatMessage> context,
@@ -265,6 +276,8 @@ class GeminiService {
           'temperature': 0.7,
           'topP': 0.95,
           'maxOutputTokens': 8192,
+          if (_supportsThinkingSummaries(model))
+            'thinkingConfig': {'includeThoughts': true},
         },
       });
 
@@ -290,10 +303,23 @@ class GeminiService {
       final parts = decoded['candidates']?[0]?['content']?['parts'] as List?;
       if (parts == null) continue;
       for (final part in parts) {
-        final text = (part as Map)['text'];
-        if (text is String && text.isNotEmpty) yield text;
+        final partMap = part as Map;
+        final text = partMap['text'];
+        if (text is String && text.isNotEmpty) {
+          yield GeminiStreamChunk(
+            text: text,
+            isThought: partMap['thought'] == true,
+          );
+        }
       }
     }
+  }
+
+  bool _supportsThinkingSummaries(String model) {
+    final normalized = model.toLowerCase();
+    return normalized.contains('gemini-2.5') ||
+        normalized.contains('gemini-3') ||
+        normalized.contains('thinking');
   }
 
   Map<String, dynamic> _contentFromMessage(ChatMessage message) => {
@@ -502,7 +528,11 @@ class ChatController extends ChangeNotifier {
         model: model,
         context: messages.take(messages.length - 1).toList(),
       )) {
-        answer.text += chunk;
+        if (chunk.isThought) {
+          answer.thoughtText += chunk.text;
+        } else {
+          answer.text += chunk.text;
+        }
         notifyListeners();
       }
       answer.isStreaming = false;
@@ -1042,6 +1072,15 @@ class MessageBubble extends StatelessWidget {
                     ],
                   ],
                 ),
+                if (message.thoughtText.trim().isNotEmpty) ...[
+                  const SizedBox(height: 8),
+                  _ThinkingBlock(
+                    text: message.thoughtText,
+                    foreground: fg,
+                    isStreaming: message.isStreaming,
+                    styleSheet: _bubbleMarkdownStyleSheet(context, fg),
+                  ),
+                ],
                 if (message.text.isNotEmpty) ...[
                   const SizedBox(height: 8),
                   MarkdownBody(
@@ -1110,6 +1149,76 @@ class MessageBubble extends StatelessWidget {
       listBullet: body,
       tableBody: body,
       tableHead: body.copyWith(fontWeight: FontWeight.w700),
+    );
+  }
+}
+
+class _ThinkingBlock extends StatelessWidget {
+  const _ThinkingBlock({
+    required this.text,
+    required this.foreground,
+    required this.isStreaming,
+    required this.styleSheet,
+  });
+
+  final String text;
+  final Color foreground;
+  final bool isStreaming;
+  final MarkdownStyleSheet styleSheet;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final colors = theme.colorScheme;
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: colors.surface.withValues(alpha: 0.28),
+        border: Border.all(color: foreground.withValues(alpha: 0.18)),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Theme(
+        data: theme.copyWith(dividerColor: Colors.transparent),
+        child: ExpansionTile(
+          initiallyExpanded: false,
+          tilePadding: const EdgeInsets.symmetric(horizontal: 12),
+          childrenPadding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+          iconColor: foreground,
+          collapsedIconColor: foreground,
+          shape: const RoundedRectangleBorder(
+            borderRadius: BorderRadius.all(Radius.circular(8)),
+          ),
+          collapsedShape: const RoundedRectangleBorder(
+            borderRadius: BorderRadius.all(Radius.circular(8)),
+          ),
+          title: Row(
+            children: [
+              Icon(Icons.lightbulb_outline, size: 18, color: foreground),
+              const SizedBox(width: 8),
+              Text(
+                'Raciocinio',
+                style: TextStyle(
+                  color: foreground,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+              if (isStreaming) ...[
+                const SizedBox(width: 8),
+                SizedBox(
+                  width: 12,
+                  height: 12,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2,
+                    color: foreground,
+                  ),
+                ),
+              ],
+            ],
+          ),
+          children: [
+            MarkdownBody(data: text, selectable: true, styleSheet: styleSheet),
+          ],
+        ),
+      ),
     );
   }
 }
