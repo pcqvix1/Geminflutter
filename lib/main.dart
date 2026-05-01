@@ -1,8 +1,10 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:file_picker/file_picker.dart';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_markdown_plus/flutter_markdown_plus.dart';
 import 'package:hive_flutter/hive_flutter.dart';
@@ -850,8 +852,21 @@ class _ChatShellState extends State<ChatShell> {
   }
 }
 
-class SessionSidebar extends StatelessWidget {
+class SessionSidebar extends StatefulWidget {
   const SessionSidebar({super.key});
+
+  @override
+  State<SessionSidebar> createState() => _SessionSidebarState();
+}
+
+class _SessionSidebarState extends State<SessionSidebar> {
+  final _scrollController = ScrollController();
+
+  @override
+  void dispose() {
+    _scrollController.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -896,33 +911,38 @@ class SessionSidebar extends StatelessWidget {
           ),
           const SizedBox(height: 10),
           Expanded(
-            child: ListView.builder(
-              itemCount: controller.filteredSessions.length,
-              itemBuilder: (context, index) {
-                final session = controller.filteredSessions[index];
-                final selected = session.id == controller.activeSessionId;
-                return ListTile(
-                  selected: selected,
-                  title: Text(
-                    session.title,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                  subtitle: Text(
-                    DateFormat('dd/MM HH:mm').format(session.updatedAt),
-                  ),
-                  leading: const Icon(Icons.chat_bubble_outline),
-                  trailing: IconButton(
-                    tooltip: 'Excluir',
-                    onPressed: () => controller.removeSession(session.id),
-                    icon: const Icon(Icons.delete_outline),
-                  ),
-                  onTap: () {
-                    Navigator.maybePop(context);
-                    controller.selectSession(session.id);
-                  },
-                );
-              },
+            child: _SmoothWheelScroll(
+              controller: _scrollController,
+              child: ListView.builder(
+                controller: _scrollController,
+                physics: const NeverScrollableScrollPhysics(),
+                itemCount: controller.filteredSessions.length,
+                itemBuilder: (context, index) {
+                  final session = controller.filteredSessions[index];
+                  final selected = session.id == controller.activeSessionId;
+                  return ListTile(
+                    selected: selected,
+                    title: Text(
+                      session.title,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    subtitle: Text(
+                      DateFormat('dd/MM HH:mm').format(session.updatedAt),
+                    ),
+                    leading: const Icon(Icons.chat_bubble_outline),
+                    trailing: IconButton(
+                      tooltip: 'Excluir',
+                      onPressed: () => controller.removeSession(session.id),
+                      icon: const Icon(Icons.delete_outline),
+                    ),
+                    onTap: () {
+                      Navigator.maybePop(context);
+                      controller.selectSession(session.id);
+                    },
+                  );
+                },
+              ),
             ),
           ),
           Padding(
@@ -1025,14 +1045,18 @@ class _ChatPanelState extends State<ChatPanel> {
           Expanded(
             child: controller.messages.isEmpty
                 ? const _EmptyState()
-                : ListView.builder(
+                : _SmoothWheelScroll(
                     controller: _scrollController,
-                    padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
-                    itemCount: controller.messages.length,
-                    addAutomaticKeepAlives: false,
-                    itemBuilder: (context, index) => MessageBubble(
-                      key: ValueKey(controller.messages[index].id),
-                      message: controller.messages[index],
+                    child: ListView.builder(
+                      controller: _scrollController,
+                      physics: const NeverScrollableScrollPhysics(),
+                      padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+                      itemCount: controller.messages.length,
+                      addAutomaticKeepAlives: false,
+                      itemBuilder: (context, index) => MessageBubble(
+                        key: ValueKey(controller.messages[index].id),
+                        message: controller.messages[index],
+                      ),
                     ),
                   ),
           ),
@@ -1095,6 +1119,81 @@ class _ChatPanelState extends State<ChatPanel> {
       duration: const Duration(milliseconds: 220),
       curve: Curves.easeOut,
     );
+  }
+}
+
+class _SmoothWheelScroll extends StatefulWidget {
+  const _SmoothWheelScroll({
+    required this.controller,
+    required this.child,
+    this.duration = const Duration(milliseconds: 190),
+    this.curve = Curves.easeOutCubic,
+  });
+
+  final ScrollController controller;
+  final Widget child;
+  final Duration duration;
+  final Curve curve;
+
+  @override
+  State<_SmoothWheelScroll> createState() => _SmoothWheelScrollState();
+}
+
+class _SmoothWheelScrollState extends State<_SmoothWheelScroll> {
+  Timer? _targetResetTimer;
+  double? _targetPixels;
+
+  @override
+  void dispose() {
+    _targetResetTimer?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Listener(
+      behavior: HitTestBehavior.translucent,
+      onPointerSignal: _handlePointerSignal,
+      child: widget.child,
+    );
+  }
+
+  void _handlePointerSignal(PointerSignalEvent event) {
+    if (event is! PointerScrollEvent || !widget.controller.hasClients) return;
+
+    final position = widget.controller.position;
+    final delta = event.scrollDelta.dy;
+    if (delta == 0 || position.maxScrollExtent <= position.minScrollExtent) {
+      return;
+    }
+
+    final basePixels = _targetPixels ?? position.pixels;
+    final targetPixels = math
+        .min(
+          math.max(basePixels + delta, position.minScrollExtent),
+          position.maxScrollExtent,
+        )
+        .toDouble();
+
+    if (targetPixels == position.pixels) return;
+
+    GestureBinding.instance.pointerSignalResolver.register(event, (_) {
+      _targetPixels = targetPixels;
+      unawaited(
+        widget.controller.animateTo(
+          targetPixels,
+          duration: widget.duration,
+          curve: widget.curve,
+        ),
+      );
+      _targetResetTimer?.cancel();
+      _targetResetTimer = Timer(
+        widget.duration + const Duration(milliseconds: 90),
+        () {
+          _targetPixels = null;
+        },
+      );
+    });
   }
 }
 
